@@ -21,11 +21,18 @@ g.r.tabor@ex.ac.uk
 
 - Displays blockMesh geometry (vertices, blocks, curved edges, boundary patches)
 - Supports all curved edge types: arc, spline, polyLine, BSpline
+- Arc edges specified by point-on-arc or circle centre (origin format)
 - Edit vertices, blocks, edges and patches interactively
 - Saves modified blockMeshDict back to file
 - Runs blockMesh and checkMesh from within the interface
 - Adds boundary layers via snappyHexMesh (wall patches only)
 - Loads reference STL/OBJ/VTK/PLY geometry for positioning
+- Right-click picking: select vertices, blocks and edges directly in the 3D viewport
+- Topology validator: automatically detects orphaned vertices, duplicate vertices,
+  out-of-range indices, crossed/inverted blocks and degenerate blocks
+- Cell zone support (for multi-region cases)
+- defaultPatch and mergePatchPairs support
+- Scale bar and bounding box coordinate display
 
 ## Requirements
 
@@ -82,15 +89,14 @@ If no blockMeshDict is found, you will be prompted to create a new one.
    - **Edges** — add curved edges (arc, spline, polyLine, BSpline)
    - **Patches** — define boundary patches and face lists
    - **Meshing** — run blockMesh, checkMesh, boundary layer addition
-4. Click **Save** (or Ctrl+S) to write the modified blockMeshDict
+4. Right-click any vertex, block or edge control point in the 3D viewport to
+   jump directly to that item in the corresponding panel
+5. Click **Save** (or Ctrl+S) to write the modified blockMeshDict
 
 ## Known limitations
 
 - Boundary layer addition tested on OF 2406 ESI only — may need
   manual adjustment of system/snappyHexMeshDict on other versions
-- Two-way selection (click vertex in 3D view → highlight in table)
-  not yet implemented
-- Topology validator does not yet detect crossed edges or degenerate blocks
 - `#include` directives in blockMeshDict are not followed
 
 ## Boundary layer meshing — known limitations
@@ -130,6 +136,9 @@ If layer addition fails or produces poor quality layers, consider:
 - pipe bend with arc edges — curved edges
 - cylinder O-grid — arc edges, multi-block 3D
 - 5-block cylinder O-grid — boundary layer addition (OF 2406 ESI and OF 12 Foundation)
+- plateHole (stress analysis tutorial) — arc origin format
+- reverseBurner — multi-region with cell zones, defaultPatch
+- mergePatchPairs case — non-conforming patch connections
 
 ## Feedback
 
