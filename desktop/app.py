@@ -331,6 +331,7 @@ class MainWindow(QMainWindow):
         self._patches_panel.patch_changed.connect(
             lambda: self._meshing_panel.load_mesh(self._mesh))
         self._meshing_panel.status_message.connect(self._on_meshing_status)
+        self._meshing_panel.tet_mesh_ready.connect(self._on_tet_mesh_ready)
 
         return content
 
@@ -484,6 +485,13 @@ class MainWindow(QMainWindow):
             return
         self._mesh.scale = value
         self._on_model_changed()
+
+    def _on_tet_mesh_ready(self, grid) -> None:
+        """Add tet mesh to the viewport alongside the block mesh."""
+        self._plotter.add_mesh(
+            grid, show_edges=True, opacity=0.3,
+            color='lightblue', name='tet_mesh')
+        self._plotter.render()
 
     def _on_model_changed(self):
         """Called whenever a panel modifies the mesh model."""

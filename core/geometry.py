@@ -152,18 +152,26 @@ def _bspline_points(ctrl_pts: np.ndarray, n: int = 64) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Polyline arc-length sampler
+# Interpolating edge sampler (polyLine / spline — curve passes through controls)
 # ---------------------------------------------------------------------------
 
-def _polyline_sample(chain: np.ndarray, n: int) -> np.ndarray:
-    """Sample *n* points uniformly by arc length along a piecewise-linear chain."""
-    segs = np.linalg.norm(np.diff(chain, axis=0), axis=1)
-    dists = np.concatenate([[0.0], np.cumsum(segs)])
-    total = dists[-1]
-    if total < 1e-15:
-        return np.tile(chain[0], (n, 1))
-    t = np.linspace(0.0, total, n)
-    return np.column_stack([np.interp(t, dists, chain[:, i]) for i in range(3)])
+def _interpolating_edge_sample(chain: np.ndarray, n: int) -> np.ndarray:
+    """Sample *n* points along a piecewise-linear chain that passes exactly
+    through each point.  Used for polyLine edges.
+
+    Distributes max(2, n // segments) linearly-spaced points per segment,
+    always including the chain points themselves as exact segment endpoints.
+    """
+    segments = len(chain) - 1
+    if segments < 1:
+        return chain
+    pts_per_seg = max(2, n // segments)
+    pieces = []
+    for i in range(segments):
+        seg_pts = np.linspace(chain[i], chain[i + 1], pts_per_seg,
+                              endpoint=(i == segments - 1))
+        pieces.append(seg_pts)
+    return np.vstack(pieces)
 
 
 # ---------------------------------------------------------------------------
@@ -217,9 +225,16 @@ def _get_edge_points(va: int, vb: int, mesh: BlockMesh, verts: list,
             chain = _build_edge_chain(edge, va, vb, verts, mesh.scale)
             if edge.kind == 'BSpline':
                 return _bspline_points(chain, n=n)
-            if edge.kind in ('polyLine', 'polySpline'):
-                return _polyline_sample(chain, n=n)
-            return pv.Spline(chain, n_points=n).points
+            if edge.kind == 'polyLine':
+                return _interpolating_edge_sample(chain, n)
+            # spline, polySpline, simpleSpline — smooth curve through control
+            # points; sample with pv.Spline then snap nearest sample to each
+            # interior control point so they appear exactly on the boundary
+            pts = pv.Spline(chain, n_points=n).points.copy()
+            for ctrl_pt in chain[1:-1]:
+                dists = np.linalg.norm(pts - ctrl_pt, axis=1)
+                pts[np.argmin(dists)] = ctrl_pt
+            return pts
     return np.linspace(p0, p1, n)
 
 

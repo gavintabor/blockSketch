@@ -10,15 +10,13 @@ Python-based: PyVista for 3D display, PyQt6 for application frame.
     pip install pyvista pyvistaqt PyQt6 numpy scipy
 
 ### Optional
-    pip install tetgen      # tetrahedral meshing (future feature)
-    pip install meshio      # tet mesh → OpenFOAM conversion (future feature)
+    pip install tetgen      # tetrahedral meshing (Meshing panel Tab 2)
 
 pyvistaqt provides QtInteractor for embedding PyVista inside PyQt6.
 scipy is required for BSpline interpolation (scipy.interpolate.BSpline).
-tetgen and meshio are not required for current functionality — blockSketch
-will run without them but the tet mesh feature will be unavailable.
-A graceful 'feature not available — install tetgen and meshio' message
-should be shown if the user tries to access tet meshing without them.
+tetgen is optional — blockSketch runs without it but the tetgen tab is
+disabled with a clear install hint. meshio is NOT required; OpenFOAM
+conversion uses tetgenToFoam directly.
 
 ## OpenFOAM compatibility
 Tested against:
@@ -56,6 +54,25 @@ BlockMesh.merge_patch_pairs; written back as mergePatchPairs ( (p1 p2) … );
 Patches panel shows a MERGE PATCH PAIRS card at the bottom with per-row combos
 and delete buttons. Topology validator checks 4–5 (crossed edges, degenerate
 blocks) implemented (2026-04-21). All planned features complete.
+Meshing panel refactored to QTabWidget with two tabs (2026-04-24): Tab 1
+retains all blockMesh/checkMesh/boundary-layer content unchanged; Tab 2
+'tetgen' implements tet mesh generation via the Python tetgen API with a
+QThread worker, watertight surface check (n_open_edges), and OpenFOAM
+conversion via tetgenToFoam subprocess. Boundary patch preservation complete
+(2026-04-25): `_build_tetgen_surface` tags patch markers as cell data;
+markers passed directly to `tetgen.TetGen(pts, faces, markers)` via
+`load_facet_markers`; `tet.triface_markers` used to write the `.face` file;
+`_rename_tet_patches` parses tetgenToFoam stdout for
+'Mapping tetgen region N to patch M' lines to build the authoritative
+region→patch mapping without any file-format inference.
+Tetgen integration complete and tested (2026-04-27): curved edge tessellation
+gaps resolved by tessellating all quad faces consistently at n=20 and merging
+with `.clean(tolerance=1e-6)`; confirmed working on cases with curved edges.
+Spline and polyLine edge tessellation fixed (2026-04-27): `_get_edge_points`
+now uses `pv.Spline` + control-point snap for spline/polySpline/simpleSpline
+(smooth curve with exact control-point positions), and per-segment
+`_interpolating_edge_sample` for polyLine (exact piecewise-linear kinks);
+confirmed working on cases with spline and polyLine edges.
 
 ## Key design decisions
 - Standalone Python parser (NOT using blockMesh library) for tolerance of 
@@ -83,7 +100,8 @@ blockSketch/
 │   ├── parser.py                  — tolerant blockMeshDict parser
 │   ├── writer.py                  — blockMeshDict serialiser (BlockMesh → text)
 │   └── geometry.py                — edge interpolation and face tessellation:
-│                                    _arc_points, _bspline_points, _polyline_sample,
+│                                    _arc_points, _bspline_points,
+│                                    _interpolating_edge_sample,
 │                                    _build_edge_chain, _get_edge_points,
 │                                    _face_has_curved_edge, _tessellate_quad,
 │                                    build_surface_mesh
@@ -207,10 +225,7 @@ Six-panel QStackedWidget layout:
   when the default patch name changes
 
 ### Meshing panel
-The Meshing panel uses a QTabWidget with two tabs. The log area and mesh
-quality display are shared between both tabs — only one meshing operation
-runs at a time, so post-run output naturally belongs to whichever tab
-triggered it.
+The Meshing panel uses a QTabWidget with two tabs:
 
 #### Tab 1 — blockMesh
 - Run blockMesh button (QProcess, stdout streamed to log)
@@ -240,21 +255,60 @@ triggered it.
   addition; enabled only when constant/polyMesh_noLayers exists; runs checkMesh
   after restore and shows '✓ Original mesh restored — mesh quality updated'
 
-#### Tab 2 — Tet mesh
-- Mesh density selector (Coarse / Medium / Fine / Custom) with auto-computed
-  maxvolume from bounding box volume V = (xmax−xmin)·(ymax−ymin)·(zmax−zmin):
+#### Tab 2 — tetgen
+- Install hint shown when tetgen is not installed; Generate and Write
+  buttons disabled with `pip install tetgen` message
+- Mesh density: four QRadioButtons (Coarse / Medium / Fine / Custom); Coarse selected by default:
     Coarse  → maxvolume = V/100
     Medium  → maxvolume = V/1000
     Fine    → maxvolume = V/10000
-    Custom  → user enters value directly
-- Advanced collapsible section: minratio (default 1.5), mindihedral (default 20)
-- Generate tet mesh button
-  — disabled if tetgen or meshio are not installed (shows install hint)
-  — disabled if surface is not watertight (shows which patches have gaps)
-- Preview in viewport button: shows tet mesh alongside block mesh
-- Write to OpenFOAM button: writes constant/polyMesh from the tet mesh
-- Shared log area (bottom of panel) shows output from whichever meshing
-  operation was last run
+    Custom  → QLineEdit for direct entry
+  V = (xmax−xmin)·(ymax−ymin)·(zmax−zmin) from current mesh vertices;
+  a single QLineEdit always shows the maxvolume value; read-only (grey) for
+  Coarse/Medium/Fine (computed from V), editable for Custom
+- Advanced collapsible section (collapsed by default): minratio (default 1.5),
+  mindihedral (default 20)
+- Generate tet mesh button: calls _build_tetgen_surface(n_curved=20) to
+  produce a triangulated, patch-marked surface, cleans the surface to merge
+  coincident boundary vertices, passes points/faces/markers directly to the
+  Python tetgen API, checks n_open_edges > 0 (not is_manifold — more
+  informative), runs tetgen in a _TetWorker(QThread) to avoid blocking the UI
+- 'Display tet mesh in viewport' QCheckBox (checked by default): when checked,
+  emits tet_mesh_ready signal after generation; app.py adds the
+  UnstructuredGrid to the plotter as a semi-transparent light-blue overlay
+- Write to OpenFOAM button (enabled only after successful Generate):
+  writes constant/tetgen/tetmesh.node, .ele, and .face from tet.node,
+  tet.elem, tet.trifaces, and tet.triface_markers (returned directly by
+  the Python API), runs tetgenToFoam, then renames patches in
+  constant/polyMesh/boundary via _rename_tet_patches
+- 'Also save tetgen files (.node, .ele, .face)' QCheckBox (unchecked by
+  default): intermediate files in constant/tetgen/ deleted after conversion
+  unless checked
+
+The two tabs share the same log area (white background, monospace) and mesh
+quality display at the bottom of the panel — only one meshing operation runs
+at a time, so post-run output naturally belongs to whichever tab triggered it.
+
+#### tetgenToFoam conversion
+The Python tetgen API returns `tet.trifaces` and `tet.triface_markers`
+directly — no `.poly` file, no subprocess, no KDTree centroid matching:
+- `_write_face_file` filters `triface_markers > 0` (boundary faces only;
+  interior faces are 0), writes `constant/tetgen/tetmesh.face` in standard
+  tetgen format with 1-based patch markers taken directly from
+  `tet.triface_markers`
+- All intermediate files go to `constant/tetgen/` (created automatically)
+- `tetgenToFoam -case <dir> constant/tetgen/tetmesh` converts to polyMesh
+- `_rename_tet_patches(tetgen_output)` post-processes `constant/polyMesh/boundary`:
+  parses the tetgenToFoam stdout for lines of the form
+  `Mapping tetgen region N to patch M`; builds `patch_idx_to_patch[M] =
+  mesh.patches[N-1]` (region N = marker N = 1-based index assigned in
+  `_build_tetgen_surface`); renames each `patchM` to the correct name and
+  restores the correct type (`wall`, `empty`, `symmetry`, etc.) — tetgenToFoam
+  writes `type patch; physicalType patch;` for every patch regardless of the
+  original type; regex fallback if `physicalType` is absent; logs a warning
+  if no mapping lines are found in the output
+- Log reports: `[✓ boundary patches preserved: name1, name2, …]`
+- Intermediate .node/.ele/.face files deleted unless 'Save tetgen files' checked
 
 #### checkMesh helper
 `_run_checkMesh(context=)` is a shared helper called from three places:
@@ -400,14 +454,17 @@ falls short of the apex control point. Rendered in purple to distinguish from
 interpolating spline (green).
 Boundary patch faces tessellated to follow curved edges, including BSpline.
 
-### Known issue — polyLine face with curved side edges
-`_tessellate_polyline_quad` builds a quad strip between the polyLine bottom edge
-and the opposite top edge, but ignores the left and right edges of the face.
-If those side edges are curved (arc or spline), the strip interior does not
-follow them, producing rendering artefacts on the affected face.
-Fix needed: sample the left and right edges too and use transfinite interpolation
-(Gordon-Hall) across the strip, or project each strip column onto the left/right
-boundary curves to respect both bottom/top and left/right curvature simultaneously.
+### Edge sampling strategy in `_get_edge_points`
+- **arc**: circumcircle sampling — unchanged
+- **BSpline**: uniform clamped B-spline via `_bspline_points` — control points
+  are NOT on the curve, so uniform parameter sampling is correct
+- **polyLine**: `_interpolating_edge_sample(chain, n)` — piecewise linear;
+  distributes `max(2, n // segments)` points per segment between consecutive
+  control points, which are always exact segment endpoints.
+- **spline, polySpline, simpleSpline**: `pv.Spline(chain, n_points=n)` for a
+  smooth curve, then each interior control point is snapped to the nearest
+  sample position so it appears exactly on the boundary.  This preserves smooth
+  curvature while fixing Gordon-Hall face tessellation corners.
 
 ## Web viewer architecture (future)
 
@@ -539,53 +596,117 @@ pip install panel trame trame-vtk trame-vuetify
 - Liam Berrisford (Exeter RSE) is a potential collaborator on
   the web viewer implementation
 
-## Future — extended meshing options
+## Extended meshing options
 
-### Tetrahedral meshing via tetgen (Tab 2 implementation notes)
-The Tet mesh tab UI is designed (see Meshing panel → Tab 2 above); the tetgen
-backend is not yet implemented. Use cases:
+### Tetrahedral meshing via tetgen
+Implemented (2026-04-24) in Meshing panel Tab 2 'tetgen'. Use cases:
 - Comparing hex (blockMesh) vs tet mesh results for the same geometry
 - Users who want a quick tet mesh without defining block topology
 - Validation studies on mesh topology effects
 
-#### Input preparation
-- tetgen Python interface available via `pip install tetgen`
-- Input: triangulated boundary patch faces (already available in model)
-- Boundary patches map naturally to tetgen region markers
-- Key requirement: surface must be watertight — need validation step
-- Output: tet mesh readable by OpenFOAM via tetgenToFoam or meshio
+#### Surface preparation — `_build_tetgen_surface`
+A dedicated function `_build_tetgen_surface(mesh, verts, n_curved=20)` builds
+the surface for tetgen. It is separate from `build_surface_mesh` (which remains
+unchanged — `merge_points=False` and quad output are correct for display).
 
-#### Curved edge handling
-For curved edges (arc, spline, polyLine, BSpline), the simple
-quad-split approach is insufficient — it would use only the 4
-corner vertices and miss the curvature entirely.
+`_build_tetgen_surface` iterates patches in index order and tessellates **all**
+quad faces with `_tessellate_quad` at `n_curved` resolution (not just those with
+curved edges). This ensures consistent shared-edge sampling: straight edges on
+both sides of a patch boundary both produce `np.linspace(p0,p1,n)`, and curved
+edges on both sides call the same `_get_edge_points`. After merging with
+`merge_points=False`, `.clean(tolerance=1e-6)` collapses the coincident
+shared-edge points and produces a closed, watertight surface.
 
-The tessellated face geometry already produced by `_tessellate_quad`
-in `viewer.py` should be reused for tetgen input. This gives tetgen
-a finely triangulated surface that follows the curves accurately.
-
-`build_surface_mesh(mesh, verts, n_curved)` is already implemented
-in `core/geometry.py`. Use directly for tetgen input with n_curved=50.
-
-`_add_boundary_patches` calls this with `n_curved=20` for display.
-Tetgen integration calls it with `n_curved=50` for mesh generation
-(higher resolution for smoother curved boundaries in the tet mesh).
-
-The resolution `n_curved` could be exposed as a user parameter in
-the Advanced section of Tab 2 — higher values give smoother
-curved boundaries at the cost of more tetgen input facets and
-longer meshing time.
-
-#### tetgen API call
-All three parameters (maxvolume, minratio, mindihedral) passed as:
 ```python
-tet.tetrahedralize(
-    order=1,
-    mindihedral=mindihedral,
-    minratio=minratio,
-    maxvolume=maxvolume
-)
+for patch_idx, patch in enumerate(mesh.patches):
+    marker = patch_idx + 1
+    for face in patch.faces:
+        if len(face) == 4:
+            poly = _tessellate_quad(face, mesh, verts, n=n_curved)
+        else:
+            # triangles: use vertices directly
+            poly = pv.PolyData(local_pts, cells)
+        poly = poly.triangulate()
+        poly.cell_data['patch_marker'] = np.full(poly.n_cells, marker, dtype=np.int32)
+        pieces.append(poly)
+merged = pieces[0]
+for p in pieces[1:]:
+    merged = merged.merge(p, merge_points=False)
+# Returns (merged, cleaned): cleaned used for watertight check and tetgen input
+return merged, merged.clean(tolerance=1e-6)
 ```
+
+The function returns `(merged, cleaned)`: the caller uses `cleaned` for both the
+open-edges check and as the tetgen input — `clean()` only merges points, so
+`patch_marker` cell data is preserved.
+
+Key properties confirmed by testing:
+- `build_surface_mesh()` with `n_curved=20` followed by `.clean(tolerance=1e-6)`
+  produces a watertight surface for tetgen including curved edge cases
+- The clean tolerance `1e-6` is appropriate for typical OpenFOAM mesh scales;
+  tighter tolerances may fail to merge near-coincident points on curved edges
+- Curved edge tessellation gaps (flat face adjacent to curved face) are fully
+  resolved by the clean operation merging the coincident shared-edge points
+
+#### Watertight check
+`surface_check.n_open_edges > 0` is used rather than `surface.is_manifold`.
+`n_open_edges` is more informative (the count appears in the error message)
+and directly meaningful: open edges are holes in the surface. Common causes:
+- Some block faces not assigned to any patch
+- 2D/extruded cases with empty patches (not a true closed 3D surface)
+- Incorrect face vertex ordering at patch boundaries
+
+#### Tetrahedralisation — `_TetWorker`
+Runs in a `_TetWorker(QThread)` to avoid blocking the UI.
+
+The Python tetgen API accepts face markers directly via the three-argument
+constructor `TetGen(points, faces, face_markers)` which calls
+`load_facet_markers` internally. The `switches` string is used for quality
+control; `tet.triface_markers` returns output boundary face markers directly —
+no `.poly` file, no subprocess, no KDTree matching needed.
+
+```python
+surface_clean = surface.clean(tolerance=1e-8)   # merge coincident boundary pts
+pts     = surface_clean.points.astype(np.float64)
+faces   = surface_clean.faces.reshape(-1, 4)[:, 1:].astype(np.int32)
+markers = surface_clean.cell_data['patch_marker'].astype(np.int32)
+
+tet = tetgen.TetGen(pts, faces, markers)
+switches = f'pq{minratio}/{mindihedral}a{maxvolume}'
+tet.tetrahedralize(switches=switches)
+# tet.triface_markers contains 1-based patch markers for boundary faces
+```
+
+`_TetWorker.finished` emits `(tet.grid, tet.node, tet.elem, tet.trifaces,
+tet.triface_markers)` as a tuple. `_on_tet_finished` stores all five on
+`self._tet_*` for use by the Write step.
+
+#### OpenFOAM conversion and patch preservation
+meshio does not support OpenFOAM as a write format. The conversion path is:
+
+1. Write `constant/tetgen/tetmesh.node` from `tet.node` (1-indexed)
+2. Write `constant/tetgen/tetmesh.ele` from `tet.elem` (1-indexed)
+3. Write `constant/tetgen/tetmesh.face` via `_write_face_file`:
+   filters `tet.triface_markers > 0` (boundary faces; interior = 0),
+   writes `i v0+1 v1+1 v2+1 marker` — markers come directly from tetgen,
+   no post-hoc centroid matching required
+4. Run `tetgenToFoam -case <dir> constant/tetgen/tetmesh`
+5. Post-process `constant/polyMesh/boundary` via `_rename_tet_patches`:
+   tetgenToFoam names patches `patch0`, `patch1`, … (0-based) from the face
+   markers; rename each `patchN` to the original name and restore the correct
+   type — tetgenToFoam writes `type patch; physicalType patch;` for every
+   patch regardless of the original type; regex fallback if `physicalType`
+   is absent
+6. Log: `[✓ boundary patches preserved: movingWall, fixedWalls, frontAndBack]`
+7. Delete `constant/tetgen/` files unless 'Save tetgen files' is checked
+
+#### Dependencies
+```bash
+pip install tetgen
+```
+tetgen is optional — blockSketch runs without it but the tetgen tab is
+disabled with a clear install hint. meshio is no longer required; the
+conversion path uses tetgenToFoam directly.
 
 ### Boundary layer meshing via snappyHexMesh layer addition
 Implemented (2026-04-14). See Meshing panel description above for full details.

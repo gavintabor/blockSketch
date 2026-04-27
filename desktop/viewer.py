@@ -10,7 +10,7 @@ import math
 
 from core.model import ArcEdge, BlockMesh, BoundaryPatch, SplineEdge
 from core.geometry import (
-    _arc_points, _arc_midpoint_from_origin, _bspline_points, _polyline_sample,
+    _arc_points, _arc_midpoint_from_origin, _bspline_points,
     _build_edge_chain, _get_edge_points, _face_has_curved_edge,
     _tessellate_quad, build_surface_mesh,
 )
@@ -25,19 +25,33 @@ def _build_vertex_cloud(mesh: BlockMesh) -> pv.PolyData:
     if not verts:
         return pv.PolyData()
     pts = np.array(verts, dtype=np.float64)
-    # Build via VTK directly so coincident points are never merged.
-    # pv.PolyData(pts) may collapse duplicate coordinates internally.
+
+    # Group vertices that share the same physical location (intentional in
+    # mergePatchPairs cases).  One point is emitted per unique position with
+    # a composite label "1,8" so the label renderer has nothing to collide
+    # and VTK's clean pass has no coincident points to merge.
+    coord_groups: dict[tuple, list[int]] = {}
+    for i, v in enumerate(mesh.vertices):
+        key = tuple(pts[i])
+        coord_groups.setdefault(key, []).append(v.index)
+
+    unique_pts = np.array(list(coord_groups.keys()), dtype=np.float64)
+    labels = [
+        ','.join(str(idx) for idx in indices)
+        for indices in coord_groups.values()
+    ]
+
     vtk_pts = vtk.vtkPoints()
-    vtk_pts.SetData(numpy_to_vtk(pts, deep=True))
+    vtk_pts.SetData(numpy_to_vtk(unique_pts, deep=True))
     vtk_verts = vtk.vtkCellArray()
-    for i in range(len(verts)):
+    for i in range(len(labels)):
         vtk_verts.InsertNextCell(1)
         vtk_verts.InsertCellPoint(i)
     vtk_pd = vtk.vtkPolyData()
     vtk_pd.SetPoints(vtk_pts)
     vtk_pd.SetVerts(vtk_verts)
     cloud = pv.wrap(vtk_pd)
-    cloud['label'] = [str(v.index) for v in mesh.vertices]
+    cloud['label'] = labels
     return cloud
 
 
