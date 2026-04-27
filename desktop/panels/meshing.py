@@ -1,5 +1,6 @@
 """
-Meshing panel — run blockMesh, view quality metrics, add boundary layers.
+Meshing panel — blockMesh / checkMesh / boundary layers (Tab 1)
+                and tet mesh via tetgen (Tab 2).
 """
 from __future__ import annotations
 
@@ -8,16 +9,27 @@ import re
 import shutil
 import subprocess
 
+import numpy as np
+
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QTextEdit, QPushButton, QFrame, QScrollArea,
     QCheckBox, QLineEdit, QSizePolicy, QGridLayout,
     QDialog, QDialogButtonBox, QMessageBox,
+    QTabWidget, QRadioButton, QButtonGroup,
 )
-from PyQt6.QtCore import Qt, QProcess, pyqtSignal
+from PyQt6.QtCore import Qt, QProcess, pyqtSignal, QThread
 from PyQt6.QtGui import QTextCursor, QFont
 
-from core.model import BlockMesh, BoundaryPatch
+from core.model import BlockMesh
+from core.geometry import (build_surface_mesh, _tessellate_quad,
+                           _face_has_curved_edge)
+
+try:
+    import tetgen as _tetgen      # noqa: F401
+    TET_AVAILABLE = True
+except ImportError:
+    TET_AVAILABLE = False
 
 ACCENT = '#6030a0'
 PASTEL = '#e8d8f8'
@@ -25,19 +37,22 @@ GREEN  = '#1a6b30'
 AMBER  = '#8a5c00'
 RED    = '#a02010'
 
+_DENSITY_LABELS   = ['Coarse', 'Medium', 'Fine', 'Custom']
+_DENSITY_DIVISORS = [100, 1000, 10000, None]   # None → custom entry
+_DENSITY_HINTS    = [
+    'Coarse — maxvolume = V / 100',
+    'Medium — maxvolume = V / 1,000',
+    'Fine — maxvolume = V / 10,000',
+    'Custom — enter maxvolume directly',
+]
+
 # Quality metric thresholds — (ok_limit, warn_limit).
-# Values ≤ ok_limit → green; ok_limit < value ≤ warn_limit → amber; above → red.
-# Sourced from checkMesh output; thresholds reflect OpenFOAM community norms.
 _THRESHOLDS: dict[str, tuple[float, float]] = {
     'Max aspect ratio':      ( 5.0,  20.0),
     'Max non-orthogonality': (70.0,  85.0),
     'Max skewness':          ( 4.0,  20.0),
 }
 
-# Patterns match checkMesh output lines of the form:
-#   Max aspect ratio = 9.69232
-#   Max non-orthogonality = 64.18
-#   Max skewness = 3.76
 _QUALITY_RE: dict[str, re.Pattern] = {
     'Max aspect ratio':      re.compile(
         r'Max aspect ratio\s*=\s*([\d.eE+\-]+)'),
@@ -53,15 +68,7 @@ _QUALITY_RE: dict[str, re.Pattern] = {
 # ---------------------------------------------------------------------------
 
 def _detect_of_version() -> str:
-    """Detect the installed OpenFOAM branch and version.
-
-    Tries ESI (foamVersion) first, then Foundation (of-version).
-    Returns a single-line string ready to log, e.g.:
-        'OpenFOAM version: 2406 (ESI/openfoam.com)'
-        'OpenFOAM version: 12 (Foundation/openfoam.org)'
-        'OpenFOAM version: unknown — if errors occur check your OF installation'
-    """
-    # ESI / openfoam.com
+    """Detect the installed OpenFOAM branch and version."""
     try:
         r = subprocess.run(
             ['foamVersion'], capture_output=True, text=True, timeout=5)
@@ -70,7 +77,6 @@ def _detect_of_version() -> str:
             return f'OpenFOAM version: {v} (ESI/openfoam.com)'
     except (OSError, subprocess.TimeoutExpired):
         pass
-    # Foundation / openfoam.org
     try:
         r2 = subprocess.run(
             ['of-version'], capture_output=True, text=True, timeout=5)
@@ -105,7 +111,6 @@ def _case_dir_from_path(mesh_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _build_layers_block(checked: list[tuple[str, int, float]]) -> str:
-    """Build the per-patch entries inside the layers { } sub-dict."""
     return '\n'.join(
         f'        {name}\n'
         f'        {{\n'
@@ -117,7 +122,6 @@ def _build_layers_block(checked: list[tuple[str, int, float]]) -> str:
 
 
 def _build_add_layers_controls(layers_block: str) -> str:
-    """Build the complete addLayersControls { ... } block as a string."""
     lines = [
         'addLayersControls',
         '{',
@@ -151,15 +155,8 @@ def _build_add_layers_controls(layers_block: str) -> str:
 
 
 def _snappy_dict_content(layers_block: str) -> str:
-    """Build a complete snappyHexMeshDict for boundary layer addition only.
-
-    Hardcoded and known to work with OF 2406 ESI.  All three stages are
-    present but only addLayers is active; castellatedMesh and snap are both
-    false.  The geometry section is intentionally empty — sHM reads it even
-    when castellatedMesh is false on some OF versions.
-    """
+    """Complete snappyHexMeshDict for boundary layer addition only (OF 2406 ESI)."""
     alc = _build_add_layers_controls(layers_block)
-    # Use str.join to avoid f-string brace escaping entirely.
     header = (
         '/*--------------------------------*- C++ -*----------------------------------*\\\n'
         '  =========                 |\n'
@@ -250,13 +247,94 @@ def _snappy_dict_content(layers_block: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tetgen surface preparation
+# ---------------------------------------------------------------------------
+
+def _build_tetgen_surface(mesh: BlockMesh, verts: list,
+                          n_curved: int = 20):
+    """Build a triangulated surface for tetgen with 1-based patch index markers.
+
+    ALL quad faces are tessellated with _tessellate_quad at n_curved resolution,
+    not just curved ones.  This ensures shared edges between adjacent faces (one
+    curved, one flat) sample the same n points — straight edges both produce
+    np.linspace(p0,p1,n), curved edges both call the same _get_edge_points result.
+    After merging with merge_points=False, .clean() can then collapse the
+    coincident shared-edge points and produce a closed, watertight surface.
+
+    Returns (merged, cleaned): merged has patch_marker cell data intact;
+    cleaned is merged.clean(tolerance=1e-6) and is used for both the
+    watertight check and as the tetgen input.
+    """
+    import pyvista as pv
+    verts_arr = np.array(verts)
+    pieces = []
+
+    for patch_idx, patch in enumerate(mesh.patches):
+        marker = patch_idx + 1
+        for face in patch.faces:
+            if not all(fi < len(verts) for fi in face):
+                continue
+            if len(face) == 4:
+                poly = _tessellate_quad(face, mesh, verts, n=n_curved)
+            else:
+                local_pts = verts_arr[list(face)]
+                cells = np.array([len(face)] + list(range(len(face))))
+                poly = pv.PolyData(local_pts, cells)
+            poly = poly.triangulate()
+            poly.cell_data['patch_marker'] = np.full(
+                poly.n_cells, marker, dtype=np.int32)
+            pieces.append(poly)
+
+    if not pieces:
+        return pv.PolyData(), pv.PolyData()
+
+    merged = pieces[0]
+    for p in pieces[1:]:
+        merged = merged.merge(p, merge_points=False)
+    cleaned = merged.clean(tolerance=1e-6)
+    return merged, cleaned
+
+
+# ---------------------------------------------------------------------------
+# Tetgen worker thread
+# ---------------------------------------------------------------------------
+
+class _TetWorker(QThread):
+    # Emits (grid, node, elem, trifaces, triface_markers)
+    finished = pyqtSignal(object)
+    error    = pyqtSignal(str)
+
+    def __init__(self, points, faces, face_markers, minratio: float,
+                 maxvolume: float, mindihedral: float):
+        super().__init__()
+        self._points       = points
+        self._faces        = faces
+        self._face_markers = face_markers
+        self._minratio     = minratio
+        self._maxvolume    = maxvolume
+        self._mindihedral  = mindihedral
+
+    def run(self) -> None:
+        try:
+            import tetgen
+            tet = tetgen.TetGen(self._points, self._faces, self._face_markers)
+            switches = f'pq{self._minratio}/{self._mindihedral}a{self._maxvolume}'
+            tet.tetrahedralize(switches=switches)
+            markers = tet.triface_markers
+            self.finished.emit(
+                (tet.grid, tet.node, tet.elem, tet.trifaces, markers))
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+# ---------------------------------------------------------------------------
 # MeshingPanel
 # ---------------------------------------------------------------------------
 
 class MeshingPanel(QWidget):
 
-    # str: message,  str: level — 'ok' | 'warning' | 'error'
-    status_message = pyqtSignal(str, str)
+    status_message = pyqtSignal(str, str)   # message, level ('ok'|'warning'|'error')
+    tet_mesh_ready = pyqtSignal(object)     # pv.UnstructuredGrid — display in viewport
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -264,12 +342,20 @@ class MeshingPanel(QWidget):
         self._mesh: BlockMesh | None = None
         self._bm_success: bool = False
         self._patch_rows: list[tuple[QCheckBox, QLineEdit, QLineEdit]] = []
-        self._of_version: str | None = None   # detected lazily on first show
+        self._of_version: str | None = None
+
+        self._tet_grid:           object       = None   # pv.UnstructuredGrid once generated
+        self._tet_patch_names:    list[str]    = []
+        self._tet_worker: _TetWorker | None    = None
+        self._tet_node:           object       = None   # np.ndarray — output nodes
+        self._tet_elem:           object       = None   # np.ndarray — output tets
+        self._tet_trifaces:       object       = None   # np.ndarray — boundary face indices
+        self._tet_triface_markers: object      = None   # np.ndarray — per-face patch markers
 
         self._bm_process    = QProcess(self)
-        self._cm_process    = QProcess(self)   # checkMesh, run after blockMesh or layer addition
+        self._cm_process    = QProcess(self)
         self._layer_process = QProcess(self)
-        self._cm_context: str = 'post_bm'      # 'post_bm' | 'post_layers' | 'post_restore'
+        self._cm_context: str = 'post_bm'
         self._setup_processes()
 
         self._build_ui()
@@ -294,9 +380,9 @@ class MeshingPanel(QWidget):
     def load_mesh(self, mesh: BlockMesh) -> None:
         self._mesh = mesh
         self._rebuild_patch_list()
+        self._update_maxvolume_display()
 
     def set_topology_errors(self, has_errors: bool) -> None:
-        """Disable Run blockMesh when the topology validator reports red errors."""
         self._run_bm_btn.setEnabled(not has_errors)
         if has_errors:
             self._run_bm_btn.setToolTip('Fix topology errors before running blockMesh.')
@@ -318,74 +404,272 @@ class MeshingPanel(QWidget):
         self._cm_process.readyReadStandardOutput.connect(self._on_cm_output)
         self._cm_process.finished.connect(self._on_cm_finished)
 
-        self._layer_process.readyReadStandardOutput.connect(
-            self._on_layer_output)
+        self._layer_process.readyReadStandardOutput.connect(self._on_layer_output)
         self._layer_process.finished.connect(self._on_layer_finished)
 
     # ------------------------------------------------------------------
-    # UI construction
+    # UI construction — top-level
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
 
-        layout.addLayout(self._make_section_header('MESHING'))
-        layout.addLayout(self._make_blockmesh_section())
-        layout.addWidget(self._make_hsep())
+        self._tabs = QTabWidget()
+        self._tabs.setStyleSheet("""
+            QTabWidget::pane {
+                border: 1px solid #ddd; border-radius: 3px;
+                background: #f7f5f0;
+            }
+            QTabBar::tab {
+                background: #e0d8f0; color: #5a4080;
+                border: 1px solid #ddd; border-bottom: none;
+                border-top-left-radius: 3px; border-top-right-radius: 3px;
+                padding: 4px 14px; font-size: 12px;
+            }
+            QTabBar::tab:selected {
+                background: #f7f5f0; color: #6030a0; font-weight: bold;
+            }
+            QTabBar::tab:hover:!selected { background: #ede8f8; }
+        """)
+        self._tabs.addTab(self._make_blockmesh_tab(), 'blockMesh')
+        self._tabs.addTab(self._make_tet_tab(),       'tetgen')
+        layout.addWidget(self._tabs, stretch=2)
+
         layout.addWidget(self._make_quality_section())
-        layout.addWidget(self._make_hsep())
-        layout.addLayout(self._make_layers_section())
+        layout.addWidget(self._make_shared_log(), stretch=1)
 
-    def _make_section_header(self, text: str) -> QHBoxLayout:
-        row = QHBoxLayout()
-        lbl = QLabel(text)
-        lbl.setStyleSheet(
-            f'color: {ACCENT}; font-weight: bold; font-size: 11px; letter-spacing: 2px;')
-        row.addWidget(lbl)
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet(f'color: {ACCENT};')
-        row.addWidget(sep)
-        return row
+    # ------------------------------------------------------------------
+    # Tab 1 — blockMesh
+    # ------------------------------------------------------------------
 
-    def _make_blockmesh_section(self) -> QVBoxLayout:
-        section = QVBoxLayout()
-        section.setSpacing(6)
+    def _make_blockmesh_tab(self) -> QWidget:
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
 
-        # Run button
+        lay.addLayout(self._make_section_header('MESHING'))
+
         self._run_bm_btn = QPushButton('▶  Run blockMesh')
         self._run_bm_btn.setStyleSheet(self._primary_btn_style())
         self._run_bm_btn.clicked.connect(self._on_run_blockmesh)
-        section.addWidget(self._run_bm_btn)
+        lay.addWidget(self._run_bm_btn)
 
-        # Log area
-        self._log = QTextEdit()
-        self._log.setReadOnly(True)
-        self._log.setFont(QFont('Monospace', 9))
-        self._log.setStyleSheet("""
-            QTextEdit {
-                background: white; color: #111;
-                border: 1px solid #ccc; border-radius: 3px;
-                padding: 4px;
+        lay.addWidget(self._make_hsep())
+        lay.addLayout(self._make_layers_section())
+        lay.addStretch()
+        return tab
+
+    # ------------------------------------------------------------------
+    # Tab 2 — Tet mesh
+    # ------------------------------------------------------------------
+
+    def _make_tet_tab(self) -> QWidget:
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+
+        # Install hint (shown when tetgen not installed)
+        if not TET_AVAILABLE:
+            hint = QLabel(
+                'Requires tetgen:\n'
+                '  pip install tetgen'
+            )
+            hint.setStyleSheet(
+                'color: #a06010; font-size: 11px; font-family: monospace;'
+                ' background: #fff8e8; border: 1px solid #e8c060;'
+                ' border-radius: 3px; padding: 6px;')
+            hint.setWordWrap(True)
+            lay.addWidget(hint)
+
+        lay.addLayout(self._make_section_header('TET MESH'))
+        lay.addWidget(self._make_density_section())
+        lay.addWidget(self._make_advanced_section())
+
+        # Generate button + display checkbox
+        self._generate_btn = QPushButton('▶  Generate tet mesh')
+        self._generate_btn.setEnabled(TET_AVAILABLE)
+        self._generate_btn.setStyleSheet(self._primary_btn_style())
+        self._generate_btn.clicked.connect(self._on_generate_tet)
+        lay.addWidget(self._generate_btn)
+
+        self._display_tet_cb = QCheckBox('Display tet mesh in viewport')
+        self._display_tet_cb.setChecked(True)
+        self._display_tet_cb.setStyleSheet('color: #222; font-size: 12px;')
+        lay.addWidget(self._display_tet_cb)
+
+        lay.addWidget(self._make_hsep())
+
+        # Write button + save tetgen files checkbox
+        self._write_tet_btn = QPushButton('Write to OpenFOAM')
+        self._write_tet_btn.setEnabled(False)
+        self._write_tet_btn.setStyleSheet(self._secondary_btn_style())
+        self._write_tet_btn.clicked.connect(self._on_write_tet)
+        lay.addWidget(self._write_tet_btn)
+
+        self._save_tetgen_cb = QCheckBox('Also save tetgen files (.node, .ele)')
+        self._save_tetgen_cb.setChecked(False)
+        self._save_tetgen_cb.setStyleSheet('color: #222; font-size: 12px;')
+        lay.addWidget(self._save_tetgen_cb)
+
+        lay.addStretch()
+        return tab
+
+    def _make_density_section(self) -> QWidget:
+        box = QWidget()
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
+        # Radio buttons: Coarse | Medium | Fine | Custom
+        radio_row = QHBoxLayout()
+        radio_row.setContentsMargins(0, 0, 0, 0)
+        self._density_bg = QButtonGroup(box)
+        for i, text in enumerate(_DENSITY_LABELS):
+            rb = QRadioButton(text)
+            rb.setStyleSheet(f'color: #444; font-size: 12px;')
+            if i == 0:
+                rb.setChecked(True)
+            self._density_bg.addButton(rb, i)
+            radio_row.addWidget(rb, stretch=1)
+        lay.addLayout(radio_row)
+
+        self._density_bg.idToggled.connect(self._on_density_changed)
+
+        # maxvolume field — always visible; read-only for Coarse/Medium/Fine,
+        # editable for Custom
+        self._maxvol_edit = QLineEdit()
+        self._maxvol_edit.setPlaceholderText('maxvolume')
+        self._maxvol_edit.setReadOnly(True)
+        self._maxvol_edit.setStyleSheet(_field_style() + """
+            QLineEdit[readOnly="true"] {
+                background: #f0f0f0; color: #666;
             }
         """)
-        self._log.setMinimumHeight(160)
-        self._log.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        section.addWidget(self._log)
+        lay.addWidget(self._maxvol_edit)
 
-        return section
+        # Hint label
+        self._density_hint = QLabel(_DENSITY_HINTS[0])
+        self._density_hint.setStyleSheet(
+            'color: #888; font-size: 11px; font-style: italic;')
+        self._density_hint.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        lay.addWidget(self._density_hint)
+
+        self._update_maxvolume_display()
+        return box
+
+    def _make_advanced_section(self) -> QWidget:
+        box = QWidget()
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+
+        toggle = QPushButton('▸ Advanced quality settings')
+        toggle.setCheckable(True)
+        toggle.setChecked(False)
+        toggle.setFlat(True)
+        toggle.setStyleSheet(f"""
+            QPushButton {{
+                color: {ACCENT}; font-size: 11px; text-align: left;
+                background: transparent; border: none; padding: 2px 0;
+            }}
+            QPushButton:hover {{ color: #4a2080; }}
+        """)
+
+        container = QWidget()
+        container.setVisible(False)
+        grid = QGridLayout(container)
+        grid.setContentsMargins(8, 4, 0, 4)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(4)
+
+        for row_i, (label, default) in enumerate(
+                [('minratio', '1.5'), ('mindihedral', '20')]):
+            lbl = QLabel(label)
+            lbl.setStyleSheet('color: #444; font-size: 12px;')
+            grid.addWidget(lbl, row_i, 0)
+            edit = QLineEdit(default)
+            edit.setFixedWidth(60)
+            edit.setStyleSheet(_field_style())
+            grid.addWidget(edit, row_i, 1)
+            if label == 'minratio':
+                self._minratio_edit = edit
+            else:
+                self._mindihedral_edit = edit
+
+        def _toggle(checked: bool) -> None:
+            container.setVisible(checked)
+            toggle.setText(
+                ('▾ ' if checked else '▸ ') + 'Advanced quality settings')
+
+        toggle.toggled.connect(_toggle)
+        outer.addWidget(toggle)
+        outer.addWidget(container)
+        return box
+
+    # ------------------------------------------------------------------
+    # Density / maxvolume helpers
+    # ------------------------------------------------------------------
+
+    def _bbox_volume(self) -> float | None:
+        if self._mesh is None:
+            return None
+        verts = self._mesh.scaled_vertices()
+        if not verts:
+            return None
+        pts = np.array(verts)
+        diffs = pts.max(axis=0) - pts.min(axis=0)
+        vol = float(np.prod(diffs))
+        return vol if vol > 0 else None
+
+    def _on_density_changed(self, pos: int, checked: bool) -> None:
+        if not checked:
+            return
+        is_custom = (pos == 3)
+        self._maxvol_edit.setReadOnly(not is_custom)
+        self._maxvol_edit.setStyleSheet(_field_style() + (
+            "" if is_custom else
+            "QLineEdit[readOnly=\"true\"] { background: #f0f0f0; color: #666; }"
+        ))
+        self._density_hint.setText(_DENSITY_HINTS[pos])
+        if is_custom:
+            self._maxvol_edit.clear()
+            self._maxvol_edit.setFocus()
+        else:
+            self._update_maxvolume_display()
+
+    def _update_maxvolume_display(self) -> None:
+        pos = self._density_bg.checkedId() if hasattr(self, '_density_bg') else 0
+        if pos == 3:
+            return
+        vol = self._bbox_volume()
+        divisor = _DENSITY_DIVISORS[pos]
+        if vol is not None:
+            self._maxvol_edit.setText(f'{vol / divisor:.3g}')
+        else:
+            self._maxvol_edit.setText('')
+
+    def _get_maxvolume(self) -> float | None:
+        try:
+            return float(self._maxvol_edit.text())
+        except ValueError:
+            return None
+
+    # ------------------------------------------------------------------
+    # Shared quality section and log
+    # ------------------------------------------------------------------
 
     def _make_quality_section(self) -> QFrame:
         box = QFrame()
-        box.setStyleSheet(f"""
-            QFrame {{
+        box.setStyleSheet("""
+            QFrame {
                 background: #f7f5f0;
                 border: 1px solid #ddd;
                 border-radius: 4px;
-            }}
+            }
         """)
         grid = QGridLayout(box)
         grid.setContentsMargins(10, 8, 10, 8)
@@ -404,11 +688,45 @@ class MeshingPanel(QWidget):
 
             val_lbl = QLabel('—')
             val_lbl.setStyleSheet('color: #888; font-size: 12px; border: none;')
-            val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            val_lbl.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             grid.addWidget(val_lbl, row_i, 1)
             self._quality_labels[metric] = val_lbl
 
         return box
+
+    def _make_shared_log(self) -> QTextEdit:
+        self._log = QTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setFont(QFont('Monospace', 9))
+        self._log.setStyleSheet("""
+            QTextEdit {
+                background: white; color: #111;
+                border: 1px solid #ccc; border-radius: 3px;
+                padding: 4px;
+            }
+        """)
+        self._log.setMinimumHeight(100)
+        self._log.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        return self._log
+
+    # ------------------------------------------------------------------
+    # blockMesh section helpers
+    # ------------------------------------------------------------------
+
+    def _make_section_header(self, text: str) -> QHBoxLayout:
+        row = QHBoxLayout()
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
+            f'color: {ACCENT}; font-weight: bold; font-size: 11px;'
+            ' letter-spacing: 2px;')
+        row.addWidget(lbl)
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f'color: {ACCENT};')
+        row.addWidget(sep)
+        return row
 
     def _make_layers_section(self) -> QVBoxLayout:
         section = QVBoxLayout()
@@ -442,7 +760,7 @@ class MeshingPanel(QWidget):
             dlg.adjustSize()
             dlg.exec()
 
-        info_btn = QPushButton('\u24d8')
+        info_btn = QPushButton('ⓘ')
         info_btn.setFixedSize(20, 20)
         info_btn.setStyleSheet("""
             QPushButton {
@@ -456,7 +774,6 @@ class MeshingPanel(QWidget):
 
         section.addLayout(hdr)
 
-        # Scrollable patch list
         self._patch_scroll = QScrollArea()
         self._patch_scroll.setWidgetResizable(True)
         self._patch_scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -476,13 +793,11 @@ class MeshingPanel(QWidget):
         self._no_walls_label.setWordWrap(True)
         self._no_walls_label.setVisible(False)
         self._patch_layout.addWidget(self._no_walls_label)
-
         self._patch_layout.addStretch()
 
         self._patch_scroll.setWidget(self._patch_container)
         section.addWidget(self._patch_scroll)
 
-        # Run layer addition button
         self._run_layer_btn = QPushButton('▶  Run layer addition')
         self._run_layer_btn.setEnabled(False)
         self._run_layer_btn.setToolTip(
@@ -491,7 +806,6 @@ class MeshingPanel(QWidget):
         self._run_layer_btn.clicked.connect(self._on_run_layers)
         section.addWidget(self._run_layer_btn)
 
-        # Restore original mesh button
         self._restore_mesh_btn = QPushButton('↩  Restore original mesh')
         self._restore_mesh_btn.setEnabled(False)
         self._restore_mesh_btn.setToolTip(
@@ -508,7 +822,6 @@ class MeshingPanel(QWidget):
     # ------------------------------------------------------------------
 
     def _rebuild_patch_list(self) -> None:
-        # Clear existing rows (preserve the no_walls_label and trailing stretch)
         for i in reversed(range(self._patch_layout.count())):
             item = self._patch_layout.itemAt(i)
             if item and item.widget() and item.widget() is not self._no_walls_label:
@@ -542,7 +855,7 @@ class MeshingPanel(QWidget):
         row_layout.setSpacing(6)
 
         cb = QCheckBox(name)
-        cb.setStyleSheet(f'color: #222; font-size: 12px;')
+        cb.setStyleSheet('color: #222; font-size: 12px;')
         cb.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         row_layout.addWidget(cb)
 
@@ -602,7 +915,6 @@ class MeshingPanel(QWidget):
 
     def _on_bm_finished(self, exit_code: int, _status) -> None:
         if exit_code == 0:
-            # blockMesh has produced a fresh base mesh — any existing backup is stale
             stale = self._no_layers_dir()
             if os.path.isdir(stale):
                 try:
@@ -655,7 +967,7 @@ class MeshingPanel(QWidget):
                     'Mesh restored but checkMesh failed', 'warning')
 
     # ------------------------------------------------------------------
-    # checkMesh helper — shared by post-blockMesh and post-layer paths
+    # checkMesh helper
     # ------------------------------------------------------------------
 
     def _run_checkMesh(self, context: str = 'post_bm') -> None:
@@ -674,7 +986,6 @@ class MeshingPanel(QWidget):
 
     def _parse_quality(self, log_text: str) -> None:
         for metric, pattern in _QUALITY_RE.items():
-            # Take the last match (blockMesh may report for multiple mesh passes)
             matches = pattern.findall(log_text)
             if not matches:
                 continue
@@ -682,7 +993,6 @@ class MeshingPanel(QWidget):
                 value = float(matches[-1])
             except ValueError:
                 continue
-
             colour = _colour_for(metric, value)
             lbl = self._quality_labels[metric]
             lbl.setText(f'{value:.4g}')
@@ -703,7 +1013,6 @@ class MeshingPanel(QWidget):
             self._log.append('[error] No patches selected for layer addition.')
             return
 
-        # Guard against layering an already-layered mesh
         if os.path.isdir(self._no_layers_dir()):
             dlg = QMessageBox(self)
             dlg.setWindowTitle('Boundary layers already added')
@@ -721,13 +1030,11 @@ class MeshingPanel(QWidget):
             self._log.append('\n[restoring original mesh before re-running layers…]')
             if not self._restore_polymesh():
                 return
-            # polyMesh_noLayers is still in place — reuse it as the backup
         else:
             if not self._backup_polymesh():
                 return
 
         self._write_mesh_quality_dict()
-
         dict_path = self._write_snappy_dict(checked)
         if dict_path is None:
             return
@@ -755,7 +1062,6 @@ class MeshingPanel(QWidget):
         if exit_code == 0:
             self._log.append('\n[snappyHexMesh layer addition finished successfully]')
             self._run_checkMesh(context='post_layers')
-            # buttons re-enabled by _on_cm_finished once checkMesh completes
         else:
             self._run_layer_btn.setEnabled(self._bm_success)
             self._run_bm_btn.setEnabled(True)
@@ -794,11 +1100,10 @@ class MeshingPanel(QWidget):
         self._restore_mesh_btn.setEnabled(exists)
 
     def _backup_polymesh(self) -> bool:
-        """Copy constant/polyMesh → constant/polyMesh_noLayers. Returns True on success."""
         src, dst = self._polymesh_dir(), self._no_layers_dir()
         try:
             shutil.copytree(src, dst)
-            self._log.append(f'[backed up polyMesh → polyMesh_noLayers]\n')
+            self._log.append('[backed up polyMesh → polyMesh_noLayers]\n')
             self._update_restore_btn()
             return True
         except OSError as exc:
@@ -806,13 +1111,12 @@ class MeshingPanel(QWidget):
             return False
 
     def _restore_polymesh(self) -> bool:
-        """Copy constant/polyMesh_noLayers → constant/polyMesh. Returns True on success."""
         src, dst = self._no_layers_dir(), self._polymesh_dir()
         try:
             if os.path.isdir(dst):
                 shutil.rmtree(dst)
             shutil.copytree(src, dst)
-            self._log.append(f'[restored polyMesh_noLayers → polyMesh]\n')
+            self._log.append('[restored polyMesh_noLayers → polyMesh]\n')
             return True
         except OSError as exc:
             self._log.append(f'[error] Could not restore polyMesh: {exc}')
@@ -823,7 +1127,6 @@ class MeshingPanel(QWidget):
     # ------------------------------------------------------------------
 
     def _get_checked_patches(self) -> list[tuple[str, int, float]]:
-        """Return (name, n_layers, expansion_ratio) for every ticked patch."""
         result = []
         for cb, n_edit, exp_edit in self._patch_rows:
             if not cb.isChecked():
@@ -840,7 +1143,6 @@ class MeshingPanel(QWidget):
         return result
 
     def _write_mesh_quality_dict(self) -> None:
-        """Write system/meshQualityDict if it does not already exist."""
         path = os.path.join(self._case_dir, 'system', 'meshQualityDict')
         if os.path.exists(path):
             return
@@ -893,15 +1195,12 @@ errorReduction          0.75;
 
     def _write_snappy_dict(
             self, checked: list[tuple[str, int, float]]) -> str | None:
-        """Write system/snappyHexMeshDict; return the path or None on failure."""
         content = _snappy_dict_content(_build_layers_block(checked))
-
         self._log.append(
             '[⚠ snappyHexMeshDict written by blockSketch — tested on OF 2406 ESI.\n'
             '   If you encounter errors on other versions, check\n'
             '   system/snappyHexMeshDict and adjust manually.]'
         )
-
         path = os.path.join(self._case_dir, 'system', 'snappyHexMeshDict')
         try:
             with open(path, 'w') as fh:
@@ -910,6 +1209,260 @@ errorReduction          0.75;
         except OSError as exc:
             self._log.append(f'[error] Could not write snappyHexMeshDict: {exc}')
             return None
+
+    # ------------------------------------------------------------------
+    # Tet mesh — generate
+    # ------------------------------------------------------------------
+
+    def _on_generate_tet(self) -> None:
+        if self._mesh is None:
+            self.status_message.emit('No mesh loaded', 'error')
+            return
+
+        maxvolume = self._get_maxvolume()
+        if maxvolume is None or maxvolume <= 0:
+            self.status_message.emit('Invalid maxvolume — check settings', 'error')
+            return
+
+        try:
+            minratio    = float(self._minratio_edit.text())
+            mindihedral = float(self._mindihedral_edit.text())
+        except ValueError:
+            self.status_message.emit('Invalid advanced quality settings', 'error')
+            return
+
+        verts = self._mesh.scaled_vertices()
+        self._log.clear()
+        self._log.append(f'[building surface mesh for tetgen (maxvolume={maxvolume:.3g})…]')
+
+        # Build triangulated surface with patch markers for the .face file.
+        # _build_tetgen_surface tessellates all quads at n=20 for consistent
+        # shared-edge sampling; returns (merged, cleaned).
+        _surface, surface_clean = _build_tetgen_surface(self._mesh, verts)
+        self._tet_patch_names = [p.name for p in self._mesh.patches]
+
+        if surface_clean.n_open_edges > 0:
+            self._log.append(
+                f'[error] Surface has {surface_clean.n_open_edges} open edge(s) —'
+                ' tetgen cannot proceed.\n'
+                'Common causes:\n'
+                '  • Some block faces are not assigned to any patch\n'
+                '  • 2D/extruded case with empty patches (not a closed 3D surface)\n'
+                '  • Incorrect face vertex ordering at patch boundaries'
+            )
+            self.status_message.emit(
+                f'Surface has {surface_clean.n_open_edges} open edge(s) — check patch assignments',
+                'error')
+            return
+
+        pts     = surface_clean.points.astype(np.float64)
+        faces   = surface_clean.faces.reshape(-1, 4)[:, 1:].astype(np.int32)
+        markers = surface_clean.cell_data['patch_marker'].astype(np.int32)
+
+        self._log.append('[surface is closed — running tetgen…]')
+        self._generate_btn.setEnabled(False)
+        self._write_tet_btn.setEnabled(False)
+
+        self._tet_worker = _TetWorker(pts, faces, markers, minratio,
+                                      maxvolume, mindihedral)
+        self._tet_worker.finished.connect(self._on_tet_finished)
+        self._tet_worker.error.connect(self._on_tet_error)
+        self._tet_worker.start()
+
+    def _on_tet_finished(self, result) -> None:
+        grid, node, elem, trifaces, triface_markers = result
+        self._tet_grid            = grid
+        self._tet_node            = node
+        self._tet_elem            = elem
+        self._tet_trifaces        = trifaces
+        self._tet_triface_markers = triface_markers
+        self._log.append(
+            f'[tetgen finished — {grid.n_points} nodes, {grid.n_cells} tetrahedra]')
+        self._generate_btn.setEnabled(True)
+        self._write_tet_btn.setEnabled(True)
+        self.status_message.emit(
+            f'Tet mesh generated: {grid.n_cells} cells', 'ok')
+        if self._display_tet_cb.isChecked():
+            self.tet_mesh_ready.emit(grid)
+
+    def _on_tet_error(self, msg: str) -> None:
+        self._log.append(f'[tetgen error] {msg}')
+        self._generate_btn.setEnabled(True)
+        self.status_message.emit(f'Tet mesh failed: {msg}', 'error')
+
+    # ------------------------------------------------------------------
+    # Tet mesh — write
+    # ------------------------------------------------------------------
+
+    def _on_write_tet(self) -> None:
+        if self._tet_node is None:
+            return
+        if not self._case_dir:
+            self.status_message.emit('Case directory not set', 'error')
+            return
+
+        tetgen_dir = os.path.join(self._case_dir, 'constant', 'tetgen')
+        os.makedirs(tetgen_dir, exist_ok=True)
+        base = os.path.join(tetgen_dir, 'tetmesh')
+
+        try:
+            self._write_node_file(base + '.node', self._tet_node)
+            self._write_ele_file(base + '.ele', self._tet_elem)
+            self._write_face_file(base + '.face',
+                                  self._tet_trifaces, self._tet_triface_markers)
+            self._log.append('[wrote constant/tetgen/tetmesh.node/.ele/.face]')
+        except OSError as exc:
+            self._log.append(f'[error writing tetgen files] {exc}')
+            self.status_message.emit(f'Write failed: {exc}', 'error')
+            return
+
+        cmd = ['tetgenToFoam', '-case', self._case_dir, base]
+        self._log.append('[converting constant/tetgen/ → constant/polyMesh/…]')
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=60,
+                cwd=self._case_dir,
+            )
+            output = (result.stdout + result.stderr).strip()
+            if output:
+                self._log.append(output)
+            if result.returncode == 0:
+                renamed = self._rename_tet_patches(output)
+                if renamed:
+                    names_str = ', '.join(renamed)
+                    self._log.append(f'[✓ boundary patches preserved: {names_str}]')
+                    self.status_message.emit(
+                        f'Tet mesh written — patches: {names_str}', 'ok')
+                else:
+                    self._log.append('[✓ polyMesh written to constant/polyMesh]')
+                    self.status_message.emit(
+                        'Tet mesh written to constant/polyMesh', 'ok')
+            else:
+                self.status_message.emit('tetgenToFoam failed — check log', 'error')
+        except FileNotFoundError:
+            self._log.append(
+                '[error] tetgenToFoam not found'
+                ' — is OpenFOAM sourced in this shell?')
+            self.status_message.emit(
+                'tetgenToFoam not found — check OpenFOAM installation', 'error')
+        except subprocess.TimeoutExpired:
+            self._log.append('[error] tetgenToFoam timed out')
+            self.status_message.emit('tetgenToFoam timed out', 'error')
+
+        if not self._save_tetgen_cb.isChecked():
+            for ext in ('.node', '.ele', '.face'):
+                try:
+                    os.remove(base + ext)
+                except OSError:
+                    pass
+        else:
+            self._log.append('[tetgen files in constant/tetgen/]')
+
+    def _rename_tet_patches(self, tetgen_output: str) -> list[str]:
+        """Post-process constant/polyMesh/boundary: rename patchN entries to
+        original blockMesh patch names and restore correct patch types.
+
+        Parses the tetgenToFoam stdout for lines of the form
+            Mapping tetgen region N to patch M
+        to build the authoritative region→patchM mapping, then renames each
+        patchM to mesh.patches[N-1].name (region N was assigned marker N = patch
+        index N-1 + 1 in _build_tetgen_surface).
+
+        Returns the list of patch names successfully renamed.
+        """
+        if self._mesh is None:
+            return []
+        boundary_path = os.path.join(
+            self._case_dir, 'constant', 'polyMesh', 'boundary')
+        if not os.path.exists(boundary_path):
+            return []
+        try:
+            # Parse tetgenToFoam output for region → polyMesh patch index
+            # "Mapping tetgen region N to patch M" → patchM = mesh.patches[N-1]
+            patch_idx_to_patch = {}
+            for line in tetgen_output.split('\n'):
+                m = re.match(
+                    r'Mapping tetgen region (\d+) to patch (\d+)', line.strip())
+                if m:
+                    region    = int(m.group(1))
+                    patch_idx = int(m.group(2))
+                    if 1 <= region <= len(self._mesh.patches):
+                        patch_idx_to_patch[patch_idx] = self._mesh.patches[region - 1]
+
+            if not patch_idx_to_patch:
+                self._log.append(
+                    '[warning] No region→patch mapping found in tetgenToFoam output'
+                    ' — boundary patches not renamed')
+                return []
+
+            with open(boundary_path, 'r') as fh:
+                content = fh.read()
+
+            renamed = []
+            for patch_idx, patch in patch_idx_to_patch.items():
+                old_name = f'patch{patch_idx}'
+                if f'\n    {old_name}\n' not in content:
+                    continue
+                content = content.replace(
+                    f'\n    {old_name}\n',
+                    f'\n    {patch.name}\n',
+                )
+                renamed.append(patch.name)
+
+                # Restore type and physicalType
+                old_block = (
+                    f'    {patch.name}\n    {{\n'
+                    f'        type            patch;\n'
+                    f'        physicalType    patch;'
+                )
+                new_block = (
+                    f'    {patch.name}\n    {{\n'
+                    f'        type            {patch.patch_type};\n'
+                    f'        physicalType    {patch.patch_type};'
+                )
+                if old_block in content:
+                    content = content.replace(old_block, new_block)
+                else:
+                    content = re.sub(
+                        rf'(    {re.escape(patch.name)}\n    {{\n'
+                        rf'        type\s+)patch;',
+                        rf'\g<1>{patch.patch_type};',
+                        content,
+                    )
+
+            with open(boundary_path, 'w') as fh:
+                fh.write(content)
+
+            return renamed
+        except OSError:
+            return []
+
+    def _write_node_file(self, path: str, node: np.ndarray) -> None:
+        with open(path, 'w') as fh:
+            fh.write(f'{len(node)} 3 0 0\n')
+            for i, (x, y, z) in enumerate(node):
+                fh.write(f'{i + 1}  {x}  {y}  {z}\n')
+
+    def _write_ele_file(self, path: str, elem: np.ndarray) -> None:
+        with open(path, 'w') as fh:
+            fh.write(f'{len(elem)} 4 0\n')
+            for i, (a, b, c, d) in enumerate(elem):
+                fh.write(f'{i + 1}  {a + 1}  {b + 1}  {c + 1}  {d + 1}\n')
+
+    def _write_face_file(self, path: str, trifaces: np.ndarray,
+                         triface_markers: np.ndarray) -> None:
+        """Write tetgen .face file from tet.trifaces and tet.triface_markers.
+
+        Filters to boundary faces only (markers > 0; interior faces are 0).
+        trifaces indices are 0-based into tet.node; written 1-based.
+        """
+        mask = triface_markers > 0
+        faces   = trifaces[mask]
+        markers = triface_markers[mask]
+        with open(path, 'w') as fh:
+            fh.write(f'{len(faces)} 1\n')
+            for i, ((v0, v1, v2), m) in enumerate(zip(faces, markers)):
+                fh.write(f'{i + 1}  {v0 + 1}  {v1 + 1}  {v2 + 1}  {m}\n')
 
     # ------------------------------------------------------------------
     # Styles
